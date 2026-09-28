@@ -6,8 +6,8 @@
 
 # secrets & local env (never commit)
 .env
-testdata/keys/*private*
-testdata/keys/*.key
+# demo keys are generated locally via `mint-token genkey`; never commit either half
+testdata/keys/
 
 # OS noise
 .DS_Store

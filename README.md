@@ -218,57 +218,58 @@ actually executed and failed returns an MCP result with `isError=true`.
 
 | Condition | Client sees | Disclosure policy |
 |---|---|---|
-| Missing / invalid / expired token | `401` | Generic `invalid_token` + request ID |
-| Valid token, insufficient authority | `403` | **Generic** reason; policy IDs only in audit |
-| Unknown tool (after auth) | JSON-RPC `-32602` | May name the requested tool; never disclose the downstream catalog. Authenticate-first + timing normalization limit enumeration |
-| Malformed JSON-RPC / arguments | `400` / invalid-params | Point to schema path; never echo secrets |
-| Downstream business error | `isError=true` | Sanitized message + request ID |
-| Downstream unavailable / timeout | `-32010` / `503` | No internal hostnames, stacks, or credentials |
-| Audit write fails before allowed call | `503` | `audit_unavailable`; call **not** forwarded |
+| Missing / invalid / expired token | HTTP `401` + JSON-RPC error, message `unauthorized`, `WWW-Authenticate` header | Generic; specific reason code (e.g. `token_expired`) only in audit |
+| Valid token, insufficient authority | HTTP `200` + JSON-RPC error `-32001` `access denied by policy` | **Generic** message; matched policy IDs + reason only in audit |
+| Unknown tool (after an *allow* decision) | JSON-RPC `-32602` `unknown tool: <name>` | A denied tool never reaches this path, so an unauthorized caller cannot enumerate the catalog |
+| Malformed JSON-RPC | HTTP `400` + JSON-RPC `-32700` `parse error` | No echo of body |
+| Missing `params.name` | JSON-RPC `-32602` `invalid params` | — |
+| Unknown JSON-RPC method | JSON-RPC `-32601` `method not found` | — |
+| Downstream execution error | `isError=true` result, `tool execution failed` | Sanitized message; detail only in audit |
+
+Documented but not built: distinct `403` for policy deny, downstream timeout codes (`-32010`/`503`),
+and fail-closed behavior when the audit sink itself is unavailable.
 
 ---
 
 ## Audit model
 
-One JSON line per event, stable field order, emitted from a `defer` so it fires even on panic.
-**Two event types per allowed invocation**; a single decision event otherwise.
+One JSON line per event. **Two events for an allowed invocation** (an
+`authorization_decision` before dispatch, then a `tool_outcome` after); a **single**
+`authorization_decision` for a denied call or an authentication failure. Both events share the
+same `request_id` so they can be correlated. This is the real output of the running gateway:
 
 ```json
-{
-  "timestamp": "2026-09-28T07:42:18.421Z",
-  "event_type": "authorization_decision",
-  "schema_version": 1,
-  "request_id": "req_01K...",
-  "principal": { "subject": "alice", "groups": ["engineering"], "issuer": "https://issuer.example" },
-  "tool": "github.delete_repository",
-  "downstream": "github",
-  "decision": "deny",
-  "reason": "explicit_deny",
-  "matched_policy_ids": ["engineering-deny-delete"],
-  "policy_digest": "sha256:9a1c...",
-  "forwarded": false
-}
+{"event":"authorization_decision","ts":"2026-09-28T11:16:57.810Z","request_id":"61f916eb28859e7eb55096f12d59bb66","source_ip":"127.0.0.1","subject":"alice","issuer":"https://issuer.demo","groups":["engineering"],"tool":"github.delete_repository","allowed":false,"effect":"deny","reason":"explicit_deny","matched_denies":["engineering-deny-delete"],"policy_digest":"sha256:dc57a866..."}
+```
+
+```json
+{"event":"tool_outcome","ts":"2026-09-28T11:16:57.802Z","request_id":"3bca8aa1...","subject":"alice","tool":"github.create_issue","status":"ok","duration_ms":0}
 ```
 
 Guarantees:
 
-- **Never logs secrets** — no raw JWT, no full arguments (only an args fingerprint), no
-  redacted values. Uses a strict field allowlist, not after-the-fact scrubbing.
-- **`policy_digest`** ties each decision to the exact policy revision that produced it.
-- Audit write failure never blocks the request path silently — the decision write is
-  fail-closed; the outcome write alerts loudly.
+- **Never logs secrets** — no raw JWT and no tool arguments or downstream payloads are logged;
+  only the metadata fields shown above. This is a strict allowlist by construction (typed
+  structs), not after-the-fact scrubbing.
+- The **`authorization_decision` is written before the call is dispatched**, so a denied call is
+  always recorded and no allowed call executes without a preceding decision record.
+- **`policy_digest`** ties each decision to the exact policy revision that produced it; combined
+  with `policyctl explain` a reviewer can reproduce any verdict.
+- In this build the sink write is best-effort (JSON lines to stdout). Making the decision write
+  **fail-closed** (return `503` and refuse the call if the audit sink is unavailable) is the
+  documented production step.
 
 ---
 
 ## Downstream tools
 
-Downstream servers expose local names (`list_repositories`); the gateway exposes
-**namespaced** names (`github.list_repositories`) via an explicit route registry — routing
-never depends on splitting a string at a `.`.
+Tools are exposed under **namespaced** names (`github.list_repositories`, `payroll.get_employee`).
+Dispatch is an exact map lookup on the full name — routing never depends on splitting a string
+at a `.` (the `.` only carries meaning for policy wildcard matching, e.g. `github.*`).
 
-The take-home implements four tools behind a single `Downstream` interface, invoked over an
-**in-memory MCP transport** (fast, deterministic, zero external processes). The identical code
-path swaps to real downstream server processes in production without changing the gateway.
+The take-home implements four tools behind a single `Downstream` interface, invoked
+**in-process** (fast, deterministic, zero external processes). The identical code path swaps to
+real downstream server processes in production by providing another `Downstream` implementation.
 
 | Tool | Downstream | Behavior (mock) |
 |---|---|---|
@@ -280,6 +281,12 @@ path swaps to real downstream server processes in production without changing th
 ---
 
 ## Configuration
+
+The take-home build is configured with **command-line flags** on `cmd/gateway`
+(`-addr`, `-policy`, `-pubkey`, `-issuer`, `-audience`, `-leeway`, `-rate`, `-burst`,
+`-tls-cert`, `-tls-key`) — run `go run ./cmd/gateway -h` to list them. The consolidated
+YAML below is the shape a production deployment would use; the fields map 1:1 to those
+flags. Secrets/keys are always referenced by path, never inlined.
 
 ```yaml
 # config/config.yaml (secrets come from env/files, never inline)
@@ -315,24 +322,19 @@ audit:
 ```
 mcp-policy-gateway/
 ├── cmd/
-│   ├── gateway/          # public MCP gateway (main)
-│   ├── mint-token/       # demo-only ES256 JWT issuer utility
-│   └── policyctl/        # validate, lint, and explain policy
+│   ├── gateway/          # public MCP gateway (main): HTTP + JSON-RPC 2.0
+│   ├── mint-token/       # demo-only ES256 JWT issuer (genkey + mint)
+│   └── policyctl/        # explain a decision; lint the rulebase
 ├── internal/
 │   ├── authn/            # TokenVerifier (JWT now; X.509/SVID/VC later) -> AgentIdentity
-│   ├── policy/           # schema, compiler, PURE evaluator  <-- test centerpiece
-│   ├── catalog/          # namespacing, canonicalization, lockfile
-│   ├── gateway/          # MCP handlers, list-filtering, call pipeline
-│   ├── downstream/       # Downstream interface + in-proc mocks
-│   ├── ratelimit/        # edge (per-IP) limiter, interface for swap
-│   ├── audit/            # typed events + JSONL sink
-│   └── transportguard/   # Origin, size, headers, request ID
+│   ├── policy/           # schema, compiler, PURE evaluator, linter  <-- test centerpiece
+│   ├── gateway/          # enforcement pipeline + HTTP/JSON-RPC transport
+│   ├── downstream/       # Downstream interface + in-proc mock tools
+│   ├── ratelimit/        # edge (per-IP) token-bucket limiter
+│   └── audit/            # typed two-event model + JSONL sink
 ├── config/
-│   ├── policies.yaml
-│   └── config.yaml
-├── testdata/keys/        # clearly-marked demo EC keys (public loaded by gateway)
-├── .env.example          # placeholders only — NO secrets
-├── Makefile
+│   └── policies.yaml     # sample policy
+├── testdata/keys/        # demo EC keys, git-ignored (public key loaded by gateway)
 ├── go.mod
 └── README.md
 ```
@@ -344,24 +346,36 @@ Dependency rule that matters: **`internal/policy` imports nothing from `gateway`
 
 ## How to run
 
-> Planned commands (implementation lands in milestone 1+).
+Requires Go 1.24+ (developed on 1.27).
 
 ```bash
-make test                      # unit + integration
-make run-gateway               # start the gateway + in-proc mocks
+# 1. Generate a demo ES256 key pair (private key stays local; git-ignored).
+go run ./cmd/mint-token genkey            # writes testdata/keys/demo-ec-{private,public}.pem
 
-# mint a demo token and call a tool
-TOKEN=$(go run ./cmd/mint-token --sub alice --groups engineering --ttl 10m)
-./scripts/demo.sh "$TOKEN"
+# 2. Start the gateway (loads config/policies.yaml and the demo public key).
+go run ./cmd/gateway -addr 127.0.0.1:8080
+#    Audit events stream to stdout as JSON lines.
+#    For TLS 1.3: add -tls-cert and -tls-key.
 
-# explain a decision without running the server
-go run ./cmd/policyctl explain --user alice --groups engineering,repository-admin \
-    --tool github.delete_repository
+# 3. In another shell, mint a token and call a tool.
+TOKEN=$(go run ./cmd/mint-token mint -sub alice -groups engineering -ttl 10m)
 
-# lint the rulebase (shadowed / redundant / unreachable rules, broad wildcards)
+curl -s localhost:8080/mcp -H "Authorization: Bearer $TOKEN" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+
+curl -s localhost:8080/mcp -H "Authorization: Bearer $TOKEN" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call",
+       "params":{"name":"github.create_issue",
+                 "arguments":{"repo":"acme/docs","title":"hello"}}}'
+
+# Explain a decision without running the server.
+go run ./cmd/policyctl explain -groups engineering,repository-admin \
+    -tool github.delete_repository
+
+# Lint the rulebase (shadowed / redundant / unreachable rules).
 go run ./cmd/policyctl lint
 
-# security / regression gates
+# Security / regression gates.
 go test ./... && go test -race ./... && go vet ./...
 ```
 
@@ -406,13 +420,13 @@ Kept deliberately small per the assignment ("prefer a smaller, well-designed imp
 | Go gateway + in-proc mock tools | Real downstream server processes; service mesh / mTLS identity |
 | JWT verification (`AgentIdentity`) behind `TokenVerifier` | X.509 / SPIFFE SVID or W3C verifiable-credential identities; identity lifecycle (issue/renew/revoke) |
 | Static demo ES256 key + mint-token utility | JWKS discovery, key rotation, introspection, revocation |
-| YAML policy loaded at startup + SIGHUP reload | Signed policy bundles, approval workflow, central control plane |
+| YAML policy loaded and validated at startup | Hot reload, signed policy bundles, approval workflow, central control plane |
 | Default-deny + deny-overrides (group + tool) | Argument-level **ABAC** and delegated authorization |
 | Authorization-aware `tools/list` | Dynamic catalog subscriptions, distributed cache |
-| Catalog lockfile (SHA-256 digests) | Signed attestations / provenance chain |
-| Synchronous JSONL audit | Durable WAL, event pipeline, tamper-evident retention |
+| Policy digest (SHA-256) recorded on every decision | Signed attestations / provenance chain |
+| Synchronous JSONL audit (two-event model) | Durable WAL, event pipeline, tamper-evident retention |
 | Edge rate limit (per-IP) | Per-identity quotas, distributed limiter, output **redaction** |
-| Rulebase hygiene: `policyctl lint` + per-rule hit counters | Richer identity claims (assurance level, key-binding); policy simulation harness |
+| Rulebase hygiene: `policyctl lint` (shadowed / redundant / unreachable) + `explain` | Richer identity claims (assurance level, key-binding); policy simulation harness |
 | Unit, integration, race tests | Continuous adversarial + chaos testing |
 
 ---
@@ -420,7 +434,7 @@ Kept deliberately small per the assignment ("prefer a smaller, well-designed imp
 ## Known limitations
 
 - Static/demo verification key; no real IdP or JWKS.
-- Startup-loaded policy (plus SIGHUP reload); no signed bundle or approval flow.
+- Startup-loaded policy; no hot reload, signed bundle, or approval flow.
 - Local JSONL audit; not durable or tamper-evident.
 - In-process mock downstreams; no real network, mTLS, or circuit breakers.
 - Tool-level policy only; **no argument-level ABAC** and **no output redaction** (both

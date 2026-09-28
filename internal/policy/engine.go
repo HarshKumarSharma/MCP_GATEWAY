@@ -9,9 +9,9 @@ import (
 )
 
 // Snapshot is an immutable, validated policy set ready for evaluation.
-// It is safe for concurrent reads; reloads construct a new Snapshot and swap
-// the pointer atomically (see the gateway wiring), so an in-flight request
-// always sees one coherent version.
+// It is safe for concurrent reads. A hot-reload design (not built in this
+// take-home) would construct a new Snapshot and swap the pointer atomically, so
+// an in-flight request always sees one coherent version.
 type Snapshot struct {
 	defaults Defaults
 	rules    []Rule
@@ -22,6 +22,16 @@ type Snapshot struct {
 // every decision so a reviewer can retrieve the exact rule set later and
 // reproduce the result.
 func (s *Snapshot) Digest() string { return s.digest }
+
+// Rules returns a copy of the compiled rules, for tooling such as the linter.
+func (s *Snapshot) Rules() []Rule {
+	out := make([]Rule, len(s.rules))
+	copy(out, s.rules)
+	return out
+}
+
+// DefaultEffect returns the configured default effect.
+func (s *Snapshot) DefaultEffect() Effect { return s.defaults.Effect }
 
 // Evaluate applies default-deny with deny-overrides semantics. It is pure: no
 // I/O, no clock, no mutation. The result is independent of rule order.
