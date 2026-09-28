@@ -4,24 +4,53 @@ defaults:
   effect: deny
   conflict_resolution: deny_overrides
 
+# Group hierarchy (optional).
+#
+# "parents" lists the broader groups a group is nested within. Membership in a
+# group implies membership in each parent, transitively, so a grant made to a
+# broad group is inherited by nested teams without duplicating rules.
+#
+#   senior-engineering -> engineering -> staff
+#   hr                 -> staff
+#
+# repository-admin is intentionally NOT nested under engineering: engineering is
+# denied delete, and we do not want repository-admin to inherit that deny.
+groups:
+  - name: engineering
+    parents: [staff]
+  - name: senior-engineering
+    parents: [engineering]
+  - name: hr
+    parents: [staff]
+
 policies:
-  - id: engineering-github-read-create
-    groups: [engineering]
+  # All staff (directly or via inheritance) may list repositories.
+  - id: staff-github-read
+    groups: [staff]
     tools:
       - github.list_repositories
+    effect: allow
+
+  # Engineering (and nested teams) may open issues.
+  - id: engineering-github-create
+    groups: [engineering]
+    tools:
       - github.create_issue
     effect: allow
 
+  # Engineering may not delete repositories, even though it can do other things.
   - id: engineering-deny-delete
     groups: [engineering]
     tools: [github.delete_repository]
     effect: deny
 
+  # Only repository administrators may delete repositories.
   - id: repository-admin-delete
     groups: [repository-admin]
     tools: [github.delete_repository]
     effect: allow
 
+  # HR may read payroll records.
   - id: hr-payroll-read
     groups: [hr]
     tools: [payroll.get_employee]

@@ -132,18 +132,53 @@ Deterministic, order-independent, and small enough to prove exhaustively.
 - **Default deny** — no matching rule means no authority.
 - **Deny-overrides** — if any rule denies, the result is deny, regardless of matching allows
   or YAML order.
-- **Matching** — a rule matches iff *(any of the principal's groups matches ∧ the tool
-  matches)*. Tools support exact names and a single `*` wildcard; no regex.
+- **Matching** — a rule matches iff *(any of the caller's **effective** groups matches ∧ the
+  tool matches)*. Effective groups = the caller's own groups plus everything they inherit
+  through the optional group hierarchy (see below). Tools support an exact name, a namespace
+  wildcard (`github.*`), or the full wildcard (`*`); no regex.
 - **Enforced twice** — `tools/list` is filtered to allowed tools; `tools/call` is re-checked.
+
+### Nested groups (hierarchy)
+
+Groups may be arranged in a hierarchy so a grant made to a broad group is inherited by nested
+teams, without duplicating rules. Each group lists the `parents` it is nested within;
+membership is inherited **transitively and downward only** (a member of a child is a member of
+its parents, never the reverse).
+
+```yaml
+groups:
+  - name: engineering
+    parents: [staff]
+  - name: senior-engineering
+    parents: [engineering]   # -> engineering -> staff
+  - name: hr
+    parents: [staff]
+```
+
+A caller whose token carries only `senior-engineering` is evaluated as
+`{senior-engineering, engineering, staff}`. Semantics that fall out of this, all covered by
+tests (`internal/policy/nested_test.go`):
+
+- **Inherited allow** — a child inherits a parent's allow (`senior-engineering` gets `staff`'s grants).
+- **Inherited deny-overrides** — a deny on a parent still wins even against an allow on the child
+  (deny-overrides applies across inheritance).
+- **Downward only** — a parent never inherits a child's grants.
+- **Sibling isolation** — siblings share only common ancestors, not each other's grants.
+- **Diamonds are fine** — multiple paths to a shared ancestor are de-duplicated.
+- **Cycles are rejected at load time** (fail closed).
+
+The hierarchy is optional; with no `groups:` section, groups are flat exact-match. The hierarchy
+is folded into the policy digest, and `policyctl explain` prints the resolved effective groups.
 
 ### Evaluation
 
 ```mermaid
 flowchart TD
-    A["Gather rules matching<br/>any group + tool"] --> B{"Any match?"}
+    E["Expand caller groups via hierarchy<br/>(effective groups)"] --> A["Gather rules matching<br/>any effective group + tool"]
+    A --> B{"Any match?"}
     B -- no --> DEN["Deny: no_matching_policy"]
     B -- yes --> C{"Any deny among matches?"}
-    C -- yes --> DEN2["Deny: deny_overrides"]
+    C -- yes --> DEN2["Deny: explicit_deny / deny_overrides"]
     C -- no --> ALW["Allow: explicit_allow"]
 ```
 
@@ -163,16 +198,27 @@ version: 1
 defaults:
   effect: deny
   conflict_resolution: deny_overrides
+groups:
+  - name: engineering
+    parents: [staff]
+  - name: senior-engineering
+    parents: [engineering]
+  - name: hr
+    parents: [staff]
 policies:
-  - id: engineering-github-read-create
+  - id: staff-github-read           # inherited by engineering, hr, senior-engineering
+    groups: [staff]
+    tools: [github.list_repositories]
+    effect: allow
+  - id: engineering-github-create
     groups: [engineering]
-    tools: [github.list_repositories, github.create_issue]
+    tools: [github.create_issue]
     effect: allow
   - id: engineering-deny-delete
     groups: [engineering]
     tools: [github.delete_repository]
     effect: deny
-  - id: repository-admin-delete
+  - id: repository-admin-delete     # standalone group: not nested under engineering
     groups: [repository-admin]
     tools: [github.delete_repository]
     effect: allow
@@ -182,9 +228,13 @@ policies:
     effect: allow
 ```
 
+Inheritance example: an `engineering` caller inherits `staff`'s `github.list_repositories` grant
+without a dedicated rule.
+
 Conflict example: a user in **both** `engineering` and `repository-admin` calling
 `github.delete_repository` matches one allow and one deny → **deny wins**, independent of rule
-order.
+order. (`repository-admin` is deliberately *not* nested under `engineering`, so a pure
+repository-admin can still delete.)
 
 ---
 
@@ -421,7 +471,7 @@ Kept deliberately small per the assignment ("prefer a smaller, well-designed imp
 | JWT verification (`AgentIdentity`) behind `TokenVerifier` | X.509 / SPIFFE SVID or W3C verifiable-credential identities; identity lifecycle (issue/renew/revoke) |
 | Static demo ES256 key + mint-token utility | JWKS discovery, key rotation, introspection, revocation |
 | YAML policy loaded and validated at startup | Hot reload, signed policy bundles, approval workflow, central control plane |
-| Default-deny + deny-overrides (group + tool) | Argument-level **ABAC** and delegated authorization |
+| Default-deny + deny-overrides (group + tool) with **nested groups** (transitive hierarchy) | Argument-level **ABAC** and delegated authorization |
 | Authorization-aware `tools/list` | Dynamic catalog subscriptions, distributed cache |
 | Policy digest (SHA-256) recorded on every decision | Signed attestations / provenance chain |
 | Synchronous JSONL audit (two-event model) | Durable WAL, event pipeline, tamper-evident retention |

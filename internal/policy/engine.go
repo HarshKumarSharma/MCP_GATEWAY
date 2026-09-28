@@ -15,7 +15,10 @@ import (
 type Snapshot struct {
 	defaults Defaults
 	rules    []Rule
-	digest   string
+	// ancestors maps each defined group to its transitive set of parent groups
+	// (excluding itself), sorted. Empty when no hierarchy is configured.
+	ancestors map[string][]string
+	digest    string
 }
 
 // Digest returns the SHA-256 digest of the canonical policy. It is recorded on
@@ -40,10 +43,12 @@ func (s *Snapshot) DefaultEffect() Effect { return s.defaults.Effect }
 //   - Any matching deny          -> deny (reason: explicit_deny or deny_overrides)
 //   - One or more allows, no deny -> allow (reason: explicit_allow)
 func (s *Snapshot) Evaluate(req Request) Decision {
+	effective := s.effectiveGroups(req.Groups)
+
 	var allows, denies []string
 	for i := range s.rules {
 		r := &s.rules[i]
-		if !groupsMatch(r.Groups, req.Groups) || !toolMatch(r.Tools, req.Tool) {
+		if !groupsMatch(r.Groups, effective) || !toolMatch(r.Tools, req.Tool) {
 			continue
 		}
 		if r.Effect == Deny {
@@ -85,13 +90,41 @@ func (s *Snapshot) Evaluate(req Request) Decision {
 	}
 }
 
-// groupsMatch reports whether any rule group is one of the caller's groups.
-func groupsMatch(ruleGroups, callerGroups []string) bool {
+// effectiveGroups expands the caller's groups with everything they inherit
+// through the hierarchy. The result is a set (deduplicated). With no hierarchy
+// configured it is simply the caller's own groups.
+func (s *Snapshot) effectiveGroups(callerGroups []string) map[string]bool {
+	eff := make(map[string]bool, len(callerGroups))
+	for _, g := range callerGroups {
+		if eff[g] {
+			continue
+		}
+		eff[g] = true
+		for _, a := range s.ancestors[g] {
+			eff[a] = true
+		}
+	}
+	return eff
+}
+
+// EffectiveGroups returns the caller's effective groups (own + inherited) as a
+// sorted slice. Exposed for tooling and audit/debugging.
+func (s *Snapshot) EffectiveGroups(callerGroups []string) []string {
+	set := s.effectiveGroups(callerGroups)
+	out := make([]string, 0, len(set))
+	for g := range set {
+		out = append(out, g)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// groupsMatch reports whether any rule group is present in the caller's
+// effective group set.
+func groupsMatch(ruleGroups []string, effective map[string]bool) bool {
 	for _, rg := range ruleGroups {
-		for _, g := range callerGroups {
-			if rg == g {
-				return true
-			}
+		if effective[rg] {
+			return true
 		}
 	}
 	return false
@@ -117,7 +150,7 @@ func toolMatch(ruleTools []string, tool string) bool {
 
 // computeDigest hashes a canonical form of the policy so that semantically
 // identical policies (differing only in ordering) produce the same digest.
-func computeDigest(defaults Defaults, rules []Rule) string {
+func computeDigest(defaults Defaults, groups []GroupDef, rules []Rule) string {
 	canon := make([]Rule, len(rules))
 	copy(canon, rules)
 	for i := range canon {
@@ -130,10 +163,20 @@ func computeDigest(defaults Defaults, rules []Rule) string {
 	}
 	sort.Slice(canon, func(i, j int) bool { return canon[i].ID < canon[j].ID })
 
+	canonGroups := make([]GroupDef, len(groups))
+	copy(canonGroups, groups)
+	for i := range canonGroups {
+		p := append([]string(nil), canonGroups[i].Parents...)
+		sort.Strings(p)
+		canonGroups[i].Parents = p
+	}
+	sort.Slice(canonGroups, func(i, j int) bool { return canonGroups[i].Name < canonGroups[j].Name })
+
 	payload := struct {
-		Defaults Defaults `json:"defaults"`
-		Rules    []Rule   `json:"rules"`
-	}{defaults, canon}
+		Defaults Defaults   `json:"defaults"`
+		Groups   []GroupDef `json:"groups"`
+		Rules    []Rule     `json:"rules"`
+	}{defaults, canonGroups, canon}
 	b, _ := json.Marshal(payload)
 	sum := sha256.Sum256(b)
 	return "sha256:" + hex.EncodeToString(sum[:])

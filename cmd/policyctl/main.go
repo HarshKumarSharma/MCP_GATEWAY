@@ -66,14 +66,16 @@ func runExplain(args []string) int {
 		Tool:    *tool,
 	})
 
-	fmt.Printf("tool:           %s\n", *tool)
-	fmt.Printf("groups:         %s\n", orNone(splitCSV(*groupsCSV)))
-	fmt.Printf("effect:         %s\n", dec.Effect)
-	fmt.Printf("allowed:        %t\n", dec.Allowed)
-	fmt.Printf("reason:         %s\n", dec.Reason)
-	fmt.Printf("matched allows: %s\n", orNone(dec.MatchedAllows))
-	fmt.Printf("matched denies: %s\n", orNone(dec.MatchedDenies))
-	fmt.Printf("policy digest:  %s\n", dec.PolicyDigest)
+	groups := splitCSV(*groupsCSV)
+	fmt.Printf("%-18s%s\n", "tool:", *tool)
+	fmt.Printf("%-18s%s\n", "groups:", orNone(groups))
+	fmt.Printf("%-18s%s\n", "effective groups:", orNone(snap.EffectiveGroups(groups)))
+	fmt.Printf("%-18s%s\n", "effect:", dec.Effect)
+	fmt.Printf("%-18s%t\n", "allowed:", dec.Allowed)
+	fmt.Printf("%-18s%s\n", "reason:", dec.Reason)
+	fmt.Printf("%-18s%s\n", "matched allows:", orNone(dec.MatchedAllows))
+	fmt.Printf("%-18s%s\n", "matched denies:", orNone(dec.MatchedDenies))
+	fmt.Printf("%-18s%s\n", "policy digest:", dec.PolicyDigest)
 	return 0
 }
 

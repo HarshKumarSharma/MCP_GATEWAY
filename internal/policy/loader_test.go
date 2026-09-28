@@ -30,6 +30,56 @@ func TestLoadInvalid(t *testing.T) {
 	}
 }
 
+// Invalid group hierarchies must fail closed.
+func TestLoadInvalidGroups(t *testing.T) {
+	cases := map[string]string{
+		"self parent": "version: 1\ngroups:\n  - name: a\n    parents: [a]\npolicies: []\n",
+		"direct cycle": "version: 1\ngroups:\n" +
+			"  - name: a\n    parents: [b]\n  - name: b\n    parents: [a]\npolicies: []\n",
+		"indirect cycle": "version: 1\ngroups:\n" +
+			"  - name: a\n    parents: [b]\n  - name: b\n    parents: [c]\n  - name: c\n    parents: [a]\npolicies: []\n",
+		"duplicate group": "version: 1\ngroups:\n" +
+			"  - name: a\n    parents: [x]\n  - name: a\n    parents: [y]\npolicies: []\n",
+		"empty group name":     "version: 1\ngroups:\n  - name: \"\"\n    parents: [x]\npolicies: []\n",
+		"empty parent name":    "version: 1\ngroups:\n  - name: a\n    parents: [\"\"]\npolicies: []\n",
+		"unknown group field":  "version: 1\ngroups:\n  - name: a\n    parents: [x]\n    nope: 1\npolicies: []\n",
+		"longer cycle in tail": "version: 1\ngroups:\n  - name: a\n    parents: [b]\n  - name: b\n    parents: [c]\n  - name: c\n    parents: [b]\npolicies: []\n",
+	}
+	for name, y := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse(strings.NewReader(y)); err == nil {
+				t.Fatalf("expected error for %q, got nil", name)
+			}
+		})
+	}
+}
+
+// A valid hierarchy (including a diamond) loads and resolves ancestors.
+func TestLoadValidHierarchy(t *testing.T) {
+	s, err := Parse(strings.NewReader(`
+version: 1
+groups:
+  - name: engineering
+    parents: [staff]
+  - name: sre
+    parents: [engineering]
+  - name: lead
+    parents: [sre, engineering]
+policies:
+  - id: r
+    groups: [staff]
+    tools: [x]
+    effect: allow
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	// lead should inherit sre -> engineering -> staff, and thus the staff grant.
+	if d := s.Evaluate(Request{Groups: []string{"lead"}, Tool: "x"}); !d.Allowed {
+		t.Fatalf("lead should inherit staff grant, got %+v", d)
+	}
+}
+
 // Defaults are optional and fall back to deny / deny_overrides.
 func TestDefaultsOptional(t *testing.T) {
 	s, err := Parse(strings.NewReader("version: 1\npolicies:\n  - id: r1\n    groups: [a]\n    tools: [x]\n    effect: allow\n"))
