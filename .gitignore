@@ -1,0 +1,13 @@
+# build / test artifacts
+/bin/
+/var/
+*.out
+*.test
+
+# secrets & local env (never commit)
+.env
+testdata/keys/*private*
+testdata/keys/*.key
+
+# OS noise
+.DS_Store

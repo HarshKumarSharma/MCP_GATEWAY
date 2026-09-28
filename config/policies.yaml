@@ -1,0 +1,28 @@
+version: 1
+
+defaults:
+  effect: deny
+  conflict_resolution: deny_overrides
+
+policies:
+  - id: engineering-github-read-create
+    groups: [engineering]
+    tools:
+      - github.list_repositories
+      - github.create_issue
+    effect: allow
+
+  - id: engineering-deny-delete
+    groups: [engineering]
+    tools: [github.delete_repository]
+    effect: deny
+
+  - id: repository-admin-delete
+    groups: [repository-admin]
+    tools: [github.delete_repository]
+    effect: allow
+
+  - id: hr-payroll-read
+    groups: [hr]
+    tools: [payroll.get_employee]
+    effect: allow
