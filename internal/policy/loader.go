@@ -95,12 +95,14 @@ func compile(fl file) (*Snapshot, error) {
 		}
 	}
 
-	return &Snapshot{
+	snap := &Snapshot{
 		defaults:  fl.Defaults,
 		rules:     fl.Policies,
 		ancestors: ancestors,
 		digest:    computeDigest(fl.Defaults, fl.Groups, fl.Policies),
-	}, nil
+	}
+	snap.index = buildIndex(snap.rules)
+	return snap, nil
 }
 
 // resolveGroups validates the group hierarchy and returns, for each defined

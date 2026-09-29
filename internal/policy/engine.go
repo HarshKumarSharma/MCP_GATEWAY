@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"sort"
-	"strings"
 )
 
 // Snapshot is an immutable, validated policy set ready for evaluation.
@@ -18,7 +17,10 @@ type Snapshot struct {
 	// ancestors maps each defined group to its transitive set of parent groups
 	// (excluding itself), sorted. Empty when no hierarchy is configured.
 	ancestors map[string][]string
-	digest    string
+	// index is the inverted (bitset) index the evaluator runs on. It is built by
+	// the loader for every Snapshot returned from Load/Parse.
+	index  *ruleIndex
+	digest string
 }
 
 // Digest returns the SHA-256 digest of the canonical policy. It is recorded on
@@ -35,60 +37,6 @@ func (s *Snapshot) Rules() []Rule {
 
 // DefaultEffect returns the configured default effect.
 func (s *Snapshot) DefaultEffect() Effect { return s.defaults.Effect }
-
-// Evaluate applies default-deny with deny-overrides semantics. It is pure: no
-// I/O, no clock, no mutation. The result is independent of rule order.
-//
-//   - No rule matches            -> deny (reason: no_matching_policy)
-//   - Any matching deny          -> deny (reason: explicit_deny or deny_overrides)
-//   - One or more allows, no deny -> allow (reason: explicit_allow)
-func (s *Snapshot) Evaluate(req Request) Decision {
-	effective := s.effectiveGroups(req.Groups)
-
-	var allows, denies []string
-	for i := range s.rules {
-		r := &s.rules[i]
-		if !groupsMatch(r.Groups, effective) || !toolMatch(r.Tools, req.Tool) {
-			continue
-		}
-		if r.Effect == Deny {
-			denies = append(denies, r.ID)
-		} else {
-			allows = append(allows, r.ID)
-		}
-	}
-
-	switch {
-	case len(denies) > 0:
-		reason := ReasonExplicitDeny
-		if len(allows) > 0 {
-			reason = ReasonDenyOverrides
-		}
-		return Decision{
-			Effect:        Deny,
-			Allowed:       false,
-			Reason:        reason,
-			MatchedAllows: allows,
-			MatchedDenies: denies,
-			PolicyDigest:  s.digest,
-		}
-	case len(allows) > 0:
-		return Decision{
-			Effect:        Allow,
-			Allowed:       true,
-			Reason:        ReasonExplicitAllow,
-			MatchedAllows: allows,
-			PolicyDigest:  s.digest,
-		}
-	default:
-		return Decision{
-			Effect:       s.defaults.Effect,
-			Allowed:      s.defaults.Effect == Allow,
-			Reason:       ReasonNoMatchingPolicy,
-			PolicyDigest: s.digest,
-		}
-	}
-}
 
 // effectiveGroups expands the caller's groups with everything they inherit
 // through the hierarchy. The result is a set (deduplicated). With no hierarchy
@@ -117,35 +65,6 @@ func (s *Snapshot) EffectiveGroups(callerGroups []string) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-// groupsMatch reports whether any rule group is present in the caller's
-// effective group set.
-func groupsMatch(ruleGroups []string, effective map[string]bool) bool {
-	for _, rg := range ruleGroups {
-		if effective[rg] {
-			return true
-		}
-	}
-	return false
-}
-
-// toolMatch supports exact names, a namespace wildcard ("github.*"), and the
-// full wildcard ("*"). No regex or general globbing, keeping matching boring
-// and reviewable.
-func toolMatch(ruleTools []string, tool string) bool {
-	for _, rt := range ruleTools {
-		switch {
-		case rt == "*" || rt == tool:
-			return true
-		case strings.HasSuffix(rt, ".*"):
-			ns := strings.TrimSuffix(rt, ".*")
-			if strings.HasPrefix(tool, ns+".") {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // computeDigest hashes a canonical form of the policy so that semantically
