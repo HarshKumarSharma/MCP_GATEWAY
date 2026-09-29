@@ -27,7 +27,6 @@ effect, and only then forwards the call.
 - [Assumptions](#assumptions)
 - [Design decisions](#design-decisions)
 - [Concurrency model](#concurrency-model)
-- [Threat model](#threat-model)
 - [Scope: built vs documented](#scope-built-vs-documented)
 - [Known limitations](#known-limitations)
 - [What I would change for production](#what-i-would-change-for-production)
@@ -99,12 +98,12 @@ flowchart LR
 The design follows the standard split:
 
 - **Data plane** — the per-request hot path that enforces policy: HTTP guard → rate limit → JWT
-  verify → PDP `Evaluate` → forward → audit. It only ever *reads* a compiled policy and never
-  blocks on management operations.
+verify → PDP `Evaluate` → forward → audit. It only ever *reads* a compiled policy and never
+blocks on management operations.
 - **Control plane** — the out-of-band side that decides *what* the data plane enforces: policy
-  authoring (`config/policies.yaml`), compilation/validation into an immutable `Snapshot`
-  (`policy.Load`), and operator tooling (`policyctl explain`/`lint`). Credential issuance (the
-  `mint-token` stand-in for an IdP) is the identity control plane; the gateway only verifies.
+authoring (`config/policies.yaml`), compilation/validation into an immutable `Snapshot`
+(`policy.Load`), and operator tooling (`policyctl explain`/`lint`). Credential issuance (the
+`mint-token` stand-in for an IdP) is the identity control plane; the gateway only verifies.
 
 The boundary between them is the immutable `Snapshot`: the control plane compiles config into one
 validated artifact, and the data plane serves reads from it with no locks. Updating policy means
@@ -113,11 +112,9 @@ one coherent version (the hot-reload design; this build loads once at startup). 
 `policy_digest` stamped on every decision is the link back to the exact control-plane artifact
 that produced it.
 
-In XACML terms: the **PEP** (enforcement) and **PDP** (decision) run in the data plane; the
-**PAP** (policy administration — the YAML + `policyctl`) and **PIP** (policy information — the
-JWT claims / issuer) are control-plane concerns. This build ships a complete data plane and a
-deliberately minimal, file-based control plane; dynamic distribution (signed bundles, hot reload,
-JWKS, a central policy service) is the documented production step.
+This build ships a complete data plane and a deliberately minimal, file-based control plane;
+dynamic distribution (signed bundles, hot reload, JWKS, a central policy service) is the documented
+production step.
 
 ---
 
@@ -223,8 +220,7 @@ flowchart TD
 
 `Evaluate` runs on an inverted index of bitsets that the loader builds once per (immutable)  
 snapshot: `group → ruleset`, `tool/namespace → ruleset`, plus global `allow`/`deny` masks. A  
-decision is then set algebra: `candidates = (⋃ groups) ∩ (tool)`, then `deny = candidates ∩
-denyMask`. That is a few word-wise OR/AND operations instead of a per-rule loop, so cost scales
+decision is then set algebra: `candidates = (⋃ groups) ∩ (tool)`, then `deny = candidates ∩ denyMask`. That is a few word-wise OR/AND operations instead of a per-rule loop, so cost scales
 with the number of matching rules rather than the total rule count. Deny-overrides reduces to
 "the intersection with the deny mask is non-empty".
 
@@ -252,7 +248,7 @@ per-decision cache added; the interfaces do not change.
 | No rule matches                                   | **Deny**                                     | `no_matching_policy` |
 | Both allow and deny match (e.g. multi-group user) | **Deny**                                     | `deny_overrides`     |
 | Tool not in catalog                               | **Deny** (client sees `-32602`)              | `unknown_tool`       |
-| Invalid / expired / wrong-audience JWT            | **Reject before policy** (client sees `401`) | `token_*`            |
+| Invalid / expired / wrong-audience JWT            | **Reject before policy** (client sees `401`) | `token_`*            |
 
 
 ### Sample policy
@@ -307,8 +303,8 @@ repository-admin can still delete.)
 The gateway is an OAuth **resource server**, not an authorization server. It verifies the
 agent's bearer **JWT** and constructs an immutable `AgentIdentity{ Subject, Issuer, Groups }`
 — the only value that crosses the auth boundary. Verification lives behind a `TokenVerifier`
-interface, so the identity source can later be an X.509 / SPIFFE SVID or verifiable credential
-without touching the policy layer.
+interface, so the identity source can later be an X.509 certificate, a SPIFFE SVID (a standard
+machine/workload identity), or a verifiable credential without touching the policy layer.
 
 Mandatory checks (all must pass before an `AgentIdentity` exists):
 
@@ -320,8 +316,9 @@ not valid here.
 - Non-empty `sub`; `groups` parsed as a bounded, normalized, deduplicated string array.
 
 No token passthrough: the inbound token is audience-bound to the gateway; downstream calls use a
-separate service identity (or none, for in-process mocks). Forwarding the caller token would
-create a confused-deputy problem and break resource isolation.
+separate service identity (or none, for in-process mocks). Forwarding the caller's token downstream
+would let one service reuse another's credentials and break isolation between services (the classic
+"confused deputy" problem).
 
 ---
 
@@ -551,36 +548,17 @@ decision across calls.
 
 - Each HTTP request runs on its own goroutine (Go's `net/http`).
 - The compiled policy `Snapshot` is **immutable after build**, so the decision path is **lock-free
-  reads** — any number of requests can evaluate concurrently with no contention. A hot reload
-  (documented, not built) constructs a new Snapshot and swaps the pointer atomically, so an
-  in-flight request always sees one coherent policy version.
+reads** — any number of requests can evaluate concurrently with no contention. A hot reload
+(documented, not built) constructs a new Snapshot and swaps the pointer atomically, so an
+in-flight request always sees one coherent policy version.
 - The only mutable shared state is (a) the audit writer, guarded by a mutex around its JSON
-  encoder, and (b) the rate limiter's per-key bucket map, guarded by a mutex. Both are covered by
-  `go test -race`.
+encoder, and (b) the rate limiter's per-key bucket map, guarded by a mutex. Both are covered by
+`go test -race`.
 - The PDP (`internal/policy`) has **no shared mutable state at all**, which is what makes it safe
-  to exercise from many goroutines and simple to reason about.
+to exercise from many goroutines and simple to reason about.
 
 Decision cost is a few word-wise bitset ops (see the evaluation-engine benchmark above:
 sub-microsecond even at 10,000 rules), so the hot path stays cheap under concurrency.
-
----
-
-## Threat model
-
-A brief STRIDE pass over the client → gateway → downstream path:
-
-| Threat | Example | Mitigation |
-|---|---|---|
-| **Spoofing** | Forged/replayed token; `alg:none`; algorithm confusion | ES256 verification, algorithm allowlist + ECDSA key-type assertion, `exp`/`nbf`, exact `iss`/`aud` |
-| **Tampering** | Altered request body; edited policy file | Strict JSON parse + 1 MB cap; strict YAML schema (`KnownFields`); fail-closed load; policy digest |
-| **Repudiation** | "I never called that tool" | Append-only two-event audit trail with `request_id`, subject, matched rules, and policy digest |
-| **Information disclosure** | Error text leaks *why* auth failed; catalog enumeration | Generic client errors (reasons only in audit); denied tools never reach dispatch; no secrets logged |
-| **Denial of service** | Unauthenticated flood; oversized bodies; verify-CPU burn | Per-IP edge rate limit **before** auth; body size cap; HTTP read/write/idle timeouts |
-| **Elevation of privilege** | Multi-group user combines grants to delete; token replay at a downstream | Deny-overrides; default deny; audience binding + no token passthrough |
-
-Assets: the downstream tools (especially destructive ones), audit-trail integrity, and the
-issuer's signing key (which never resides on the gateway). Trust assumptions: the issuer mints
-correct `sub`/`groups`, and the policy author is trusted.
 
 ---
 
@@ -623,23 +601,66 @@ None of these change the core decision ordering or default-deny semantics.
 
 ## What I would change for production
 
-- **Policy engine** — keep the `PolicyEvaluator` interface but consider OPA/Rego or Cedar for
-policy-as-code, decision logs, and richer conditions; version and sign policy bundles.
-- **Credential handling** — token exchange / on-behalf-of so downstreams receive a fresh
-audience-bound token (or the gateway's own mTLS identity), never the caller's token.
-- **AuthN** — multi-issuer JWKS with bounded refresh + last-known-good; audience per resource;
-optional mTLS-bound or DPoP tokens.
-- **Identity formats & lifecycle** — support X.509 / SPIFFE SVID or verifiable-credential
-identities behind the same `TokenVerifier`, with certificate-bound (mTLS/DPoP) tokens for
-proof-of-possession, and issue / renew / revoke handled by the trusted issuer.
-- **Rate limiting** — per-identity quotas and a distributed limiter, with local emergency
-limits retained.
-- **Downstream I/O** — real MCP transports with pooling, retries (idempotency-aware),
+- **Policy engine.** Keep the `PolicyEvaluator` interface, but move the rules into a ready-made
+policy engine instead of my own evaluator. **OPA** (Open Policy Agent) and **Cedar** (from AWS) are
+the two popular ones: you write allow/deny rules in a dedicated language — OPA's is called **Rego**,
+a declarative language just for authorization — and the engine decides.
+*Why:* hand-written logic is fine at this size, but a mature org wants rules that non-Go engineers
+can read and edit, richer conditions (time-of-day, per-resource attributes), and a built-in
+decision log. Because it stays behind the same interface, adopting one never touches the gateway.
+- **Credential handling.** Never forward the caller's token downstream. Instead the gateway either
+mints a fresh, short-lived token scoped to that one downstream (**token exchange / on-behalf-of**)
+or authenticates with its own **mTLS** identity (mutual TLS — both sides present certificates, so
+the downstream cryptographically knows it's the gateway calling).
+*Why:* if the downstream received the caller's original token it could replay or reuse it, and a
+token minted for the gateway would suddenly be valid deeper in the system — the "confused deputy"
+problem. Giving each hop only the credential it needs contains the blast radius if any one token
+leaks.
+- **AuthN.** Support several token issuers via **JWKS** (the standard endpoint where an issuer
+publishes its signing keys), refreshed on a schedule with a last-known-good fallback; a separate
+audience per resource; and optionally bind a token to its holder (mTLS- or **DPoP**-bound —
+"demonstrating proof of possession" ties the token to a key the client holds).
+*Why:* real identity providers rotate keys and there's often more than one issuer; JWKS lets the
+gateway pick up new keys automatically with no redeploy or outage, and the fallback keeps auth
+working if the issuer is briefly unreachable. Per-resource audiences stop a token for one service
+being replayed at another, and holder-binding makes a token copied off the wire useless without
+the holder's key.
+- **Identity formats & lifecycle.** Accept other identity types (X.509 certificates, SPIFFE SVIDs,
+verifiable credentials) behind the same `TokenVerifier`, bound to the holder, with the full issue /
+renew / revoke lifecycle handled by the trusted issuer.
+*Why:* not every caller is a user with a JWT — services and workloads often authenticate with
+certificates or SPIFFE identities. Keeping them behind the same interface means the policy layer
+never changes, and **revocation** is what actually lets you cut off a compromised identity before
+its token expires.
+- **Rate limiting.** Limit **per identity** (per user/agent) with a distributed limiter, keeping the
+local in-memory limiter as an emergency backstop.
+*Why:* an IP is a poor proxy for "who" — many users share one IP behind NAT, and one user can
+spread across many IPs. Per-identity quotas are fair and meaningful. A distributed limiter makes
+the limit hold across all gateway replicas (in-memory counts don't add up across machines); the
+local one keeps you protected if the shared store is down.
+- **Downstream I/O.** Real MCP transports with connection pooling, idempotency-aware retries,
 circuit breakers, and health checks.
-- **Audit** — durable WAL → partitioned SIEM sink, hash-chained/signed batches, retention and
-PII governance.
-- **Observability** — OpenTelemetry traces/metrics, deny-rate alerts, latency histograms.
-- **Rollout** — shadow/dry-run mode and canaries for safe policy changes.
+*Why:* once calls cross a network they can be slow or fail halfway. Pooling reuses connections;
+**idempotency-aware** retries only re-send operations that are safe to repeat (never double
+`create`/`delete`); a **circuit breaker** stops hammering a failing service so it can recover; and
+health checks route around dead instances. Without these, one sick downstream can stall the gateway.
+- **Audit.** Write events first to a durable on-disk log (a **write-ahead log**) so none are lost on
+a crash, then ship them to the security team's log system (a **SIEM**); sign the batches, and define
+retention and personal-data handling.
+*Why:* an audit trail is only useful if it's complete and trustworthy. stdout can be lost on a
+crash or restart; persisting first guarantees no gaps. A SIEM is where security teams search and
+alert. Signing makes tampering detectable — you can prove records weren't edited or deleted after
+the fact.
+- **Observability.** OpenTelemetry traces/metrics, alerts on deny-rate spikes, and latency
+histograms.
+*Why:* you can't operate what you can't see. Traces show where a request spends time (which
+downstream is slow); a sudden jump in the deny rate is an early sign a policy change broke
+something or someone's probing; latency histograms catch regressions before users complain.
+- **Rollout.** A shadow / dry-run mode plus canaries for safe policy changes.
+*Why:* a policy edit is a production change that can lock people out. Dry-run evaluates the new
+rules against real traffic and only *logs* what they *would* decide, so you can confirm they're
+safe before they can deny anyone; canaries roll the change to a small slice of traffic first,
+limiting the damage if it's wrong.
 
 ---
 
