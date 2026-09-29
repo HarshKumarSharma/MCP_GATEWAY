@@ -26,6 +26,8 @@ effect, and only then forwards the call.
 - [How to run](#how-to-run)
 - [Assumptions](#assumptions)
 - [Design decisions](#design-decisions)
+- [Concurrency model](#concurrency-model)
+- [Threat model](#threat-model)
 - [Scope: built vs documented](#scope-built-vs-documented)
 - [Known limitations](#known-limitations)
 - [What I would change for production](#what-i-would-change-for-production)
@@ -92,6 +94,31 @@ flowchart LR
 | Gateway → audit sink | Sensitive fields, sink outage                | Field allowlist, redaction, fail-closed decision write                                           |
 
 
+### Control plane vs data plane
+
+The design follows the standard split:
+
+- **Data plane** — the per-request hot path that enforces policy: HTTP guard → rate limit → JWT
+  verify → PDP `Evaluate` → forward → audit. It only ever *reads* a compiled policy and never
+  blocks on management operations.
+- **Control plane** — the out-of-band side that decides *what* the data plane enforces: policy
+  authoring (`config/policies.yaml`), compilation/validation into an immutable `Snapshot`
+  (`policy.Load`), and operator tooling (`policyctl explain`/`lint`). Credential issuance (the
+  `mint-token` stand-in for an IdP) is the identity control plane; the gateway only verifies.
+
+The boundary between them is the immutable `Snapshot`: the control plane compiles config into one
+validated artifact, and the data plane serves reads from it with no locks. Updating policy means
+building a *new* Snapshot and swapping the pointer atomically, so an in-flight request always sees
+one coherent version (the hot-reload design; this build loads once at startup). The
+`policy_digest` stamped on every decision is the link back to the exact control-plane artifact
+that produced it.
+
+In XACML terms: the **PEP** (enforcement) and **PDP** (decision) run in the data plane; the
+**PAP** (policy administration — the YAML + `policyctl`) and **PIP** (policy information — the
+JWT claims / issuer) are control-plane concerns. This build ships a complete data plane and a
+deliberately minimal, file-based control plane; dynamic distribution (signed bundles, hot reload,
+JWKS, a central policy service) is the documented production step.
+
 ---
 
 ## Request lifecycle
@@ -138,6 +165,14 @@ tool matches)*. Effective groups = the caller's own groups plus everything they 
 through the optional group hierarchy (see below). Tools support an exact name, a namespace
 wildcard (`github.*`), or the full wildcard (`*`); no regex.
 - **Enforced twice** — `tools/list` is filtered to allowed tools; `tools/call` is re-checked.
+
+**Why deny-overrides and not first-match?** Firewalls/ACLs are classically *first-match* (ordered
+rules, first hit wins), which is powerful but order-dependent — a rule inserted in the wrong place
+silently changes access. Deny-overrides makes the decision a function of the *set* of matching
+rules, not their order, so it is robust to edits and safe for users who belong to several groups.
+It also reduces to a single bitset intersection (`candidates ∩ denyMask`; see the engine below),
+which a first-match model cannot. If priority semantics were ever needed, an explicit `priority`
+field would be the extension.
 
 ### Nested groups (hierarchy)
 
@@ -509,6 +544,43 @@ decision across calls.
 | Rate limiting        | Edge-only (per-IP, pre-auth)                          | Protects against unauthenticated floods + JWT-verify CPU burn; deeper tiers documented          |
 | Audit                | Decision before dispatch, outcome after               | No unaudited side effects; separates authorization from execution                               |
 
+
+---
+
+## Concurrency model
+
+- Each HTTP request runs on its own goroutine (Go's `net/http`).
+- The compiled policy `Snapshot` is **immutable after build**, so the decision path is **lock-free
+  reads** — any number of requests can evaluate concurrently with no contention. A hot reload
+  (documented, not built) constructs a new Snapshot and swaps the pointer atomically, so an
+  in-flight request always sees one coherent policy version.
+- The only mutable shared state is (a) the audit writer, guarded by a mutex around its JSON
+  encoder, and (b) the rate limiter's per-key bucket map, guarded by a mutex. Both are covered by
+  `go test -race`.
+- The PDP (`internal/policy`) has **no shared mutable state at all**, which is what makes it safe
+  to exercise from many goroutines and simple to reason about.
+
+Decision cost is a few word-wise bitset ops (see the evaluation-engine benchmark above:
+sub-microsecond even at 10,000 rules), so the hot path stays cheap under concurrency.
+
+---
+
+## Threat model
+
+A brief STRIDE pass over the client → gateway → downstream path:
+
+| Threat | Example | Mitigation |
+|---|---|---|
+| **Spoofing** | Forged/replayed token; `alg:none`; algorithm confusion | ES256 verification, algorithm allowlist + ECDSA key-type assertion, `exp`/`nbf`, exact `iss`/`aud` |
+| **Tampering** | Altered request body; edited policy file | Strict JSON parse + 1 MB cap; strict YAML schema (`KnownFields`); fail-closed load; policy digest |
+| **Repudiation** | "I never called that tool" | Append-only two-event audit trail with `request_id`, subject, matched rules, and policy digest |
+| **Information disclosure** | Error text leaks *why* auth failed; catalog enumeration | Generic client errors (reasons only in audit); denied tools never reach dispatch; no secrets logged |
+| **Denial of service** | Unauthenticated flood; oversized bodies; verify-CPU burn | Per-IP edge rate limit **before** auth; body size cap; HTTP read/write/idle timeouts |
+| **Elevation of privilege** | Multi-group user combines grants to delete; token replay at a downstream | Deny-overrides; default deny; audience binding + no token passthrough |
+
+Assets: the downstream tools (especially destructive ones), audit-trail integrity, and the
+issuer's signing key (which never resides on the gateway). Trust assumptions: the issuer mints
+correct `sub`/`groups`, and the policy author is trusted.
 
 ---
 
