@@ -314,17 +314,16 @@ and fail-closed behavior when the audit sink itself is unavailable.
 
 ## Audit model
 
-One JSON line per event. **Two events for an allowed invocation** (an
-`authorization_decision` before dispatch, then a `tool_outcome` after); a **single**
-`authorization_decision` for a denied call or an authentication failure. Both events share the
-same `request_id` so they can be correlated. This is the real output of the running gateway:
+One JSON line per event. An allowed invocation produces **two** events (an
+`authorization_decision` before dispatch, then a `tool_outcome` after) that share the same
+`request_id` so they can be correlated; a denied call or an authentication failure produces a
+**single** `authorization_decision`. Real output from the running gateway (an allowed
+`github.create_issue`, then the same caller denied on `github.delete_repository`):
 
 ```json
-{"event":"authorization_decision","ts":"2026-09-28T11:16:57.810Z","request_id":"61f916eb28859e7eb55096f12d59bb66","source_ip":"127.0.0.1","subject":"alice","issuer":"https://issuer.demo","groups":["engineering"],"tool":"github.delete_repository","allowed":false,"effect":"deny","reason":"explicit_deny","matched_denies":["engineering-deny-delete"],"policy_digest":"sha256:dc57a866..."}
-```
-
-```json
-{"event":"tool_outcome","ts":"2026-09-28T11:16:57.802Z","request_id":"3bca8aa1...","subject":"alice","tool":"github.create_issue","status":"ok","duration_ms":0}
+{"event":"authorization_decision","ts":"2026-09-29T09:23:56.844096Z","request_id":"23b951f252059f80eb478fdd707f7d48","source_ip":"127.0.0.1","subject":"alice","issuer":"https://issuer.demo","groups":["engineering"],"tool":"github.create_issue","allowed":true,"effect":"allow","reason":"explicit_allow","matched_allows":["engineering-github-create"],"policy_digest":"sha256:e02593ed..."}
+{"event":"tool_outcome","ts":"2026-09-29T09:23:56.844191Z","request_id":"23b951f252059f80eb478fdd707f7d48","subject":"alice","tool":"github.create_issue","status":"ok","duration_ms":0}
+{"event":"authorization_decision","ts":"2026-09-29T09:23:56.875818Z","request_id":"1ff6dae0ef40887384e3930659511b59","source_ip":"127.0.0.1","subject":"alice","issuer":"https://issuer.demo","groups":["engineering"],"tool":"github.delete_repository","allowed":false,"effect":"deny","reason":"explicit_deny","matched_denies":["engineering-deny-delete"],"policy_digest":"sha256:e02593ed..."}
 ```
 
 Guarantees:
